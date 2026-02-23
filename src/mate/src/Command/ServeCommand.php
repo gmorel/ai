@@ -20,6 +20,7 @@ use Psr\Log\LoggerInterface;
 use Symfony\AI\Mate\Agent\AgentInstructionsAggregator;
 use Symfony\AI\Mate\App;
 use Symfony\AI\Mate\Service\RegistryProvider;
+use Symfony\AI\Mate\Transport\ReactPhpHttpServerTransport;
 use Symfony\Component\Console\Attribute\AsCommand;
 use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Input\InputInterface;
@@ -33,7 +34,7 @@ use Symfony\Component\DependencyInjection\ContainerInterface;
  * @author Johannes Wachter <johannes@sulu.io>
  * @author Tobias Nyholm <tobias.nyholm@gmail.com>
  */
-#[AsCommand('serve', 'Starts the MCP server with stdio transport')]
+#[AsCommand('serve', 'Starts the MCP server')]
 class ServeCommand extends Command
 {
     public function __construct(
@@ -59,7 +60,10 @@ class ServeCommand extends Command
 
     protected function configure(): void
     {
-        $this->addOption('force-keep-alive', null, InputOption::VALUE_NONE, 'Force a restart of the server if it stops.');
+        $this
+            ->addOption('force-keep-alive', null, InputOption::VALUE_NONE, 'Force a restart of the server if it stops.')
+            ->addOption('transport', 't', InputOption::VALUE_OPTIONAL, 'Transport to use: stdio or http', 'stdio')
+            ->addOption('port', 'p', InputOption::VALUE_OPTIONAL, 'HTTP server port (only with --transport=http)', '3000');
     }
 
     protected function execute(InputInterface $input, OutputInterface $output): int
@@ -96,6 +100,24 @@ class ServeCommand extends Command
         $pidFileName = \sprintf('%s/server_%d.pid', $this->cacheDir, getmypid());
         if (false === @file_put_contents($pidFileName, (string) getmypid())) {
             $this->logger->warning('Failed to create PID file', ['path' => $pidFileName]);
+        }
+
+        if ('http' === $input->getOption('transport')) {
+            if (!class_exists(\React\Http\HttpServer::class)) {
+                $output->writeln('<error>react/http is not installed. Run: composer require react/http react/socket</error>');
+
+                return Command::FAILURE;
+            }
+
+            try {
+                $server->run(new ReactPhpHttpServerTransport('0.0.0.0', (int) $input->getOption('port'), $this->logger));
+            } finally {
+                if (file_exists($pidFileName)) {
+                    @unlink($pidFileName);
+                }
+            }
+
+            return Command::SUCCESS;
         }
 
         try {
