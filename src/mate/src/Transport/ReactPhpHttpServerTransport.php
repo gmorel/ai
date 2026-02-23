@@ -34,7 +34,7 @@ use Symfony\Component\Uid\Uuid;
  * Each POST is handled synchronously within ReactPHP's event loop.
  * Parallel tool calls from the client are queued and processed in order.
  *
- * @extends BaseTransport<null>
+ * @extends BaseTransport<mixed>
  *
  * @author Guillaume Morel
  */
@@ -61,7 +61,7 @@ final class ReactPhpHttpServerTransport extends BaseTransport
         }
     }
 
-    public function listen(): null
+    public function listen(): mixed
     {
         $http = new HttpServer(function (ServerRequestInterface $request): ReactResponse {
             return $this->handleHttpRequest($request);
@@ -119,7 +119,7 @@ final class ReactPhpHttpServerTransport extends BaseTransport
         $body = (string) $request->getBody();
         $this->handleMessage($body, $sessionId);
 
-        if (null !== $this->immediateResponse) {
+        if (null !== $this->immediateResponse) { // @phpstan-ignore-line notIdentical.alwaysFalse
             return new ReactResponse(
                 $this->immediateStatusCode,
                 array_merge($this->corsHeaders(), ['Content-Type' => 'application/json']),
