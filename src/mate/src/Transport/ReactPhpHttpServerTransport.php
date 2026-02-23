@@ -20,6 +20,8 @@ use Psr\Log\LoggerInterface;
 use React\EventLoop\Loop;
 use React\Http\HttpServer;
 use React\Http\Message\Response as ReactResponse;
+use React\Promise\Deferred;
+use React\Promise\PromiseInterface;
 use React\Socket\SocketServer;
 use Symfony\Component\Uid\Uuid;
 
@@ -31,8 +33,9 @@ use Symfony\Component\Uid\Uuid;
  * - DELETE /mcp → terminate the session
  * - OPTIONS /mcp → CORS preflight
  *
- * Each POST is handled synchronously within ReactPHP's event loop.
- * Parallel tool calls from the client are queued and processed in order.
+ * Each POST request is handled in a forked child process (pcntl_fork), keeping
+ * the ReactPHP event loop free to accept and start other requests concurrently.
+ * True parallelism: N simultaneous tool calls complete in ≈ slowest single call.
  *
  * @extends BaseTransport<mixed>
  *
@@ -63,7 +66,7 @@ final class ReactPhpHttpServerTransport extends BaseTransport
 
     public function listen(): mixed
     {
-        $http = new HttpServer(function (ServerRequestInterface $request): ReactResponse {
+        $http = new HttpServer(function (ServerRequestInterface $request): PromiseInterface|ReactResponse {
             return $this->handleHttpRequest($request);
         });
 
@@ -77,7 +80,10 @@ final class ReactPhpHttpServerTransport extends BaseTransport
         return null;
     }
 
-    private function handleHttpRequest(ServerRequestInterface $request): ReactResponse
+    /**
+     * @return PromiseInterface<ReactResponse>|ReactResponse
+     */
+    private function handleHttpRequest(ServerRequestInterface $request): PromiseInterface|ReactResponse
     {
         $path = $request->getUri()->getPath();
         $method = $request->getMethod();
@@ -103,12 +109,101 @@ final class ReactPhpHttpServerTransport extends BaseTransport
             );
         }
 
-        return $this->handlePostRequest($request);
+        // Read body before fork — PSR-7 stream can only be read once and
+        // we need the data to be in the child's memory copy.
+        $body = (string) $request->getBody();
+        $sessionIdString = $request->getHeaderLine('Mcp-Session-Id');
+
+        if (\function_exists('pcntl_fork')) {
+            return $this->forkRequest($body, $sessionIdString);
+        }
+
+        return $this->processRequest($body, $sessionIdString);
     }
 
-    private function handlePostRequest(ServerRequestInterface $request): ReactResponse
+    /**
+     * Fork a child process to handle the request synchronously.
+     * The parent registers a non-blocking read on the socket pair and returns
+     * a Promise, allowing ReactPHP to service other incoming requests immediately.
+     *
+     * @return PromiseInterface<ReactResponse>|ReactResponse
+     */
+    private function forkRequest(string $body, string $sessionIdString): PromiseInterface|ReactResponse
     {
-        $sessionIdString = $request->getHeaderLine('Mcp-Session-Id');
+        $sockets = stream_socket_pair(\STREAM_PF_UNIX, \STREAM_SOCK_STREAM, \STREAM_IPPROTO_IP);
+        if (false === $sockets) {
+            return $this->processRequest($body, $sessionIdString);
+        }
+
+        [$parentSocket, $childSocket] = $sockets;
+
+        $pid = pcntl_fork();
+
+        if (-1 === $pid) {
+            fclose($parentSocket);
+            fclose($childSocket);
+
+            return $this->processRequest($body, $sessionIdString);
+        }
+
+        if (0 === $pid) {
+            // ── CHILD ──────────────────────────────────────────────────────
+            fclose($parentSocket);
+
+            $response = $this->processRequest($body, $sessionIdString);
+
+            $payload = json_encode([
+                'status' => $response->getStatusCode(),
+                'session_id' => $this->sessionId?->toRfc4122(),
+                'body' => (string) $response->getBody(),
+            ]);
+
+            fwrite($childSocket, (string) $payload);
+            fclose($childSocket);
+            exit(0);
+        }
+
+        // ── PARENT ─────────────────────────────────────────────────────────
+        fclose($childSocket);
+        stream_set_blocking($parentSocket, false);
+
+        $deferred = new Deferred();
+        $buffer = '';
+
+        Loop::addReadStream($parentSocket, function ($stream) use ($deferred, &$buffer, $parentSocket, $pid): void {
+            $chunk = fread($stream, 65536);
+
+            if ('' !== $chunk && false !== $chunk) {
+                $buffer .= $chunk;
+            }
+
+            if (feof($stream) || false === $chunk) {
+                Loop::removeReadStream($parentSocket);
+                fclose($parentSocket);
+                pcntl_waitpid($pid, $status, \WNOHANG);
+
+                $data = json_decode($buffer, true);
+
+                if (!\is_array($data)) {
+                    $deferred->resolve(new ReactResponse(500, $this->corsHeaders(), 'Worker error'));
+
+                    return;
+                }
+
+                $headers = array_merge($this->corsHeaders(), ['Content-Type' => 'application/json']);
+                if (isset($data['session_id'])) {
+                    $headers['Mcp-Session-Id'] = (string) $data['session_id'];
+                }
+
+                $deferred->resolve(new ReactResponse((int) $data['status'], $headers, (string) $data['body']));
+            }
+        });
+
+        return $deferred->promise();
+    }
+
+    private function processRequest(string $body, string $sessionIdString): ReactResponse
+    {
         $sessionId = '' !== $sessionIdString ? Uuid::fromString($sessionIdString) : null;
 
         $this->immediateResponse = null;
@@ -116,7 +211,6 @@ final class ReactPhpHttpServerTransport extends BaseTransport
         $this->sessionId = $sessionId;
         $this->sessionFiber = null;
 
-        $body = (string) $request->getBody();
         $this->handleMessage($body, $sessionId);
 
         if (null !== $this->immediateResponse) { // @phpstan-ignore-line notIdentical.alwaysFalse
